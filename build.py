@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import subprocess
@@ -11,7 +12,21 @@ from typing import Any
 
 from dotenv import load_dotenv
 
+from check_image_sources import check_image_sources
+from generate_manifest import ManifestError, check_manifest
+from worker_purge import WorkerPurgeError, load_worker_purge_config, purge_worker_cache
+
 load_dotenv()
+
+CDN_CACHE_CONTROL = "public, max-age=86400, stale-while-revalidate=604800"
+CDN_CONTENT_TYPES = {
+    ".glb": "model/gltf-binary",
+    ".json": "application/json",
+    ".ogg": "audio/ogg",
+    ".svg": "image/svg+xml",
+    ".ttf": "font/ttf",
+    ".woff2": "font/woff2",
+}
 
 
 class BuildError(RuntimeError):
@@ -47,23 +62,26 @@ class DeleteOperation:
     reason: str
 
 
+def upload_extra_args(key: str) -> dict[str, str] | None:
+    content_type = CDN_CONTENT_TYPES.get(Path(key).suffix.casefold())
+    if content_type is None:
+        return None
+    return {"ContentType": content_type, "CacheControl": CDN_CACHE_CONTROL}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sync changed asset files for a release to R2.")
     parser.add_argument("--current-ref", help="Current release ref/tag to diff from.")
     parser.add_argument("--previous-ref", help="Previous release ref/tag to diff against.")
     parser.add_argument("--assets-root", default="assets", help="Repo-relative assets root. Default: assets")
     parser.add_argument("--dry-run", action="store_true", help="Print the sync plan without writing to R2.")
+    parser.add_argument("--workers", type=int, default=32, help="Concurrent R2 uploads. Default: 32")
     return parser.parse_args()
 
 
 def run_git(args: list[str]) -> str:
     try:
-        completed = subprocess.run(
-            ["git", *args],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+        completed = subprocess.run(["git", *args], check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError as exc:
         stderr = exc.stderr.strip()
         detail = f": {stderr}" if stderr else ""
@@ -148,14 +166,18 @@ def infer_current_ref(explicit_ref: str | None) -> str:
     return run_git(["describe", "--tags", "--exact-match", "HEAD"])
 
 
-def infer_previous_ref(current_ref: str, explicit_ref: str | None) -> str:
+def infer_previous_ref(current_ref: str, explicit_ref: str | None) -> str | None:
+    try:
+        run_git(["rev-parse", "--verify", f"{current_ref}^{{commit}}"])
+    except BuildError as exc:
+        raise BuildError(f"invalid current release ref {current_ref!r}") from exc
+
     if explicit_ref:
         return explicit_ref
-
     try:
         return run_git(["describe", "--tags", "--abbrev=0", f"{current_ref}^"])
-    except BuildError as exc:
-        raise BuildError(f"could not determine previous tag for {current_ref!r}") from exc
+    except BuildError:
+        return None
 
 
 def git_diff_entries(previous_ref: str, current_ref: str) -> list[DiffEntry]:
@@ -225,7 +247,9 @@ def build_sync_plan(entries: list[DiffEntry], assets_root: str) -> dict[str, Any
                     skipped.append({"path": new_path, "reason": "not_a_file"})
                     continue
                 uploads.append(
-                    UploadOperation(local_path=local_path.as_posix(), key=key_for_path(new_path, assets_root), reason="renamed")
+                    UploadOperation(
+                        local_path=local_path.as_posix(), key=key_for_path(new_path, assets_root), reason="renamed"
+                    )
                 )
             counts["renamed"] += 1
             continue
@@ -240,7 +264,11 @@ def build_sync_plan(entries: list[DiffEntry], assets_root: str) -> dict[str, Any
             if not local_path.is_file():
                 skipped.append({"path": new_path, "reason": "not_a_file"})
                 continue
-            uploads.append(UploadOperation(local_path=local_path.as_posix(), key=key_for_path(new_path, assets_root), reason="copied"))
+            uploads.append(
+                UploadOperation(
+                    local_path=local_path.as_posix(), key=key_for_path(new_path, assets_root), reason="copied"
+                )
+            )
             counts["added"] += 1
             continue
 
@@ -285,12 +313,39 @@ def create_r2_client(config: R2Config):
     )
 
 
-def apply_sync_plan(plan: dict[str, Any], config: R2Config) -> None:
+def apply_sync_plan(plan: dict[str, Any], config: R2Config, workers: int, before_manifest=None) -> None:
+    if workers < 1:
+        raise BuildError("workers must be at least 1")
     client = create_r2_client(config)
+
+    def upload_file(upload: dict[str, str]) -> None:
+        extra_args = upload_extra_args(upload["key"]) or {}
+        client.upload_file(upload["local_path"], config.bucket, upload["key"], ExtraArgs=extra_args)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [
+            executor.submit(upload_file, upload) for upload in plan["uploads"] if upload["key"] != "manifest.json"
+        ]
+        for future in concurrent.futures.as_completed(futures):
+            future.result()
+
+    deletions = plan["deletes"]
+    for offset in range(0, len(deletions), 1000):
+        batch = deletions[offset : offset + 1000]
+        response = client.delete_objects(
+            Bucket=config.bucket, Delete={"Objects": [{"Key": deletion["key"]} for deletion in batch], "Quiet": True}
+        )
+        errors = response.get("Errors", [])
+        if errors:
+            details = ", ".join(f"{error.get('Key')}: {error.get('Message')}" for error in errors)
+            raise BuildError(f"R2 delete failed: {details}")
+
+    # Announce the new hashes only once all referenced uploads/deletions succeed.
+    if before_manifest is not None:
+        before_manifest()
     for upload in plan["uploads"]:
-        client.upload_file(upload["local_path"], config.bucket, upload["key"])
-    for deletion in plan["deletes"]:
-        client.delete_object(Bucket=config.bucket, Key=deletion["key"])
+        if upload["key"] == "manifest.json":
+            upload_file(upload)
 
 
 def build_summary(
@@ -317,20 +372,25 @@ def build_summary(
 def main() -> int:
     args = parse_args()
     assets_root = normalize_assets_root(args.assets_root)
+    try:
+        check_manifest(Path(assets_root), Path(assets_root) / "manifest.json")
+    except ManifestError as exc:
+        raise BuildError(str(exc)) from exc
     current_ref = infer_current_ref(args.current_ref)
     first_release = False
 
-    try:
-        previous_ref = infer_previous_ref(current_ref, args.previous_ref)
-        entries = git_diff_entries(previous_ref, current_ref)
-    except BuildError:
-        if args.previous_ref:
-            raise
-        previous_ref = None
+    previous_ref = infer_previous_ref(current_ref, args.previous_ref)
+    if previous_ref is None:
         first_release = True
         entries = collect_all_asset_entries(assets_root)
+    else:
+        entries = git_diff_entries(previous_ref, current_ref)
 
     plan = build_sync_plan(entries, assets_root)
+    try:
+        source_summary = check_image_sources(Path(assets_root))
+    except ValueError as exc:
+        raise BuildError(str(exc)) from exc
 
     summary = build_summary(
         current_ref=current_ref,
@@ -341,9 +401,30 @@ def main() -> int:
         first_release=first_release,
     )
 
+    summary['image_sources'] = source_summary
+
     if not args.dry_run:
+        try:
+            purge_config = load_worker_purge_config()
+            if purge_config is None:
+                raise WorkerPurgeError('Selective Worker purge must be configured before publishing assets')
+        except WorkerPurgeError as exc:
+            raise BuildError(str(exc)) from exc
         config = load_r2_config()
-        apply_sync_plan(plan, config)
+        changed_keys = sorted(
+            {item['key'] for item in plan['uploads'] + plan['deletes'] if item['key'] != 'manifest.json'}
+        )
+        try:
+            apply_sync_plan(
+                plan, config, args.workers, before_manifest=lambda: purge_worker_cache(purge_config, changed_keys)
+            )
+            if any(item['key'] == 'manifest.json' for item in plan['uploads']):
+                purge_worker_cache(purge_config, ['manifest.json'])
+        except Exception as exc:
+            raise BuildError(
+                'R2 sync or selective cache clearing failed. Some objects may have changed. '
+                'Repair the upload failure and rerun this exact release.'
+            ) from exc
 
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
